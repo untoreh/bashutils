@@ -1,0 +1,172 @@
+#!/bin/bash
+## standalone process cpulimiter
+
+[ -z "$1" -o -z "$pid" ] && echo "USAGE: pid=PID limitmon LIMIT" && exit 1
+
+readonly limit=$1
+readonly active=1000
+applied_active="0.${active}"
+
+trap "kill -SIGCONT $pid; exit" SIGINT SIGTERM EXIT
+
+fleep()
+{
+    [[ -n "${_snore_fd:-}" ]] || exec {_snore_fd}<> >(:)
+    read ${1:+-t "$1"} -u $_snore_fd || :
+}
+
+## get statistics for process cpu usage monitoring
+get_pid_stats(){
+    pid="${pid:-$(pgrep php)}"
+    [ -z "$pid" -o ! -a /proc/"$pid" ] && return 1
+    read pupt < /proc/uptime;
+    read stat < /proc/${pid}/stat && c=1 && for i in $stat; do
+            case "$c" in
+                14)
+                    utime=$i
+                    ;;
+                15)
+                    stime=$i
+                    ;;
+                16)
+                    cutime=$i
+                    ;;
+                17)
+                    cstime=$i
+                    ;;
+                22)
+                    starttime=$i
+                    break
+                    ;;
+            esac
+            c=$((c+1));
+        done
+    uptimet=${pupt/.} && uptime=${uptimet/ *}
+}
+
+# calc an unit of cpu usage with interval $1
+proc_usg_u(){
+    get_pid_stats
+    uptime1=$uptime
+    proctime1=$((utime+stime+cutime+cstime))
+    fleep $1
+    get_pid_stats
+    uptime2=$uptime
+    proctime2=$((utime+stime+cutime+cstime))
+    proc_perc_usg=$(((proctime2-proctime1)*100/(uptime2-uptime1)))
+}
+
+## cpu monitor $cpumon_pid $cpumon_span $cpumon_ival
+cpumon() {
+    export proc_usg
+    pid=${cpumon_pid:-$(pgrep php)}
+    ## timespan
+    local span=${cpumon_span:-60}
+    ## interval
+    local ival=${cpumon_ival:-3}
+    local iter=$((span/ival))
+    local record=()
+    while true; do
+        # perc=$(top -n1 | grep php | grep -v grep | awk '{print gensub("%","","", $8)}')
+        proc_usg_u 0.1 ## sets proc_perc_usg
+        [ -z "$proc_perc_usg" ] && fleep $ival && continue
+        record+=($proc_perc_usg)
+        i=$((${#record[@]}-iter))
+        [ $i -lt 0 ] && i=0
+        record=(${record[@]:i})
+        sum=0
+        for p in ${record[@]}; do
+            sum=$((sum+p))
+        done
+        proc_usg=$((sum/${#record[@]}))
+        # span=$((ival*${#record[@]}))s
+        # echo "usage in $span is $proc_usg"
+        echo "$proc_usg"
+        fleep $ival
+    done
+}
+
+## VERSION BY KILL THE LIMITER
+# ## calc limit
+# mlimit=$((limit*100))
+# limitmon(){
+#     while read -ru $1 proc_usg ; do
+#         if [ $proc_usg -gt $limit ]; then
+#             applied_limit=$((100-(mlimit/proc_usg)))
+#             passive=$((((active*(active/applied_limit))-(active*10))/100))
+#             if [ $passive -lt 0 ]; then
+#                 applied_active=$((applied_active+passive*-1))
+#                 applied_passive=0
+#             else
+#                 applied_active="0.${active}"
+#                 applied_passive="0.${passive}"
+#             fi
+#             # echo "limiting with $applied_active and $applied_passive"
+#             [ -n "$lpid" ] && kill -KILL $lpid
+#             limit & lpid=$!
+#         else
+#             [ -n "$lpid" ] && kill -KILL $lpid && unset lpid
+#             kill -SIGCONT $pid || { echo "process not found" && exit 1; }
+#         fi
+#     done
+#     # echo "$lpid"
+# }
+
+# ## limit
+# limit() {
+#     while true; do
+#         fleep $applied_active
+#         kill -SIGSTOP $pid
+#         fleep $applied_passive
+#         kill -SIGCONT $pid
+#     done
+# }
+
+## calc limit
+mlimit=$((limit*100))
+limitmon(){
+    coproc limiter { limit; } & lpid=$!
+    more_limit=$((limit+(limit/4)))
+    less_limit=$((limit-(limit/4)))
+    while read -ru $1 proc_usg ; do
+        if [ $proc_usg -gt $more_limit ]; then
+            applied_limit=$((100-(mlimit/proc_usg)))
+            passive=$((((active*(active/applied_limit))-(active*10))/100))
+            if [ $passive -lt 0 ]; then
+                applied_active=$((applied_active+passive*-1))
+                applied_passive=0
+            else
+                applied_active="0.${active}"
+                applied_passive="0.${passive}"
+            fi
+            # echo "limiting with $applied_active and $applied_passive"
+            echo "$applied_active $applied_passive" >&${limiter[1]}
+            kill -SIGQUIT $lpid
+            kill -SIGCONT $lpid
+            # [ -n "$lpid" ] && kill -KILL $lpid
+            # limit
+        elif [ $proc_usg -lt $less_limit ]; then
+            # [ -n "$lpid" ] && kill -KILL $lpid && unset lpid
+            kill -SIGSTOP $lpid
+            kill -SIGCONT $pid || { echo "process not found" && exit 1; }
+        fi
+    done
+}
+
+
+
+## limit
+limit() {
+    local apply
+    trap 'read apply; applied_active=${apply/ *} applied_passive=${apply/* }' SIGQUIT
+    while [ -z "$apply" ]; do fleep 1; done
+    while true; do
+        fleep ${applied_active}
+        kill -SIGSTOP $pid
+        fleep ${applied_passive}
+        kill -SIGCONT $pid
+    done
+}
+
+coproc cpumon { cpumon_pid=$pid cpumon_span=2 cpumon_ival=1 cpumon; }
+limitmon ${cpumon[0]} 2>/dev/null

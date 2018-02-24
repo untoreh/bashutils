@@ -1,0 +1,83 @@
+#!/bin/bash
+## standalone cpumonitor
+
+export pid="${cpumon_pid:-$(pgrep -n php)}"
+[ -z "$pid" ] && echo "no process to monitor is running (\$cpumon_pid)" && exit 1
+
+fleep()
+{
+    [[ -n "${_snore_fd:-}" ]] || exec {_snore_fd}<> >(:)
+    read ${1:+-t "$1"} -u $_snore_fd || :
+}
+
+## get statistics for process cpu usage monitoring
+get_pid_stats(){
+    [ -z "$pid" -o ! -a /proc/"$pid" ] && return 1
+    read pupt < /proc/uptime;
+    read stat < /proc/${pid}/stat && c=1 && for i in $stat; do
+            case "$c" in
+                14)
+                    utime=$i
+                    ;;
+                15)
+                    stime=$i
+                    ;;
+                16)
+                    cutime=$i
+                    ;;
+                17)
+                    cstime=$i
+                    ;;
+                22)
+                    starttime=$i
+                    break
+                    ;;
+            esac
+            c=$((c+1));
+        done
+    uptimet=${pupt/.} && uptime=${uptimet/ *}
+}
+
+# calc an unit of cpu usage with interval $1
+proc_usg_u(){
+    get_pid_stats
+    uptime1=$uptime
+    proctime1=$((utime+stime+cutime+cstime))
+    fleep $1
+    get_pid_stats
+    uptime2=$uptime
+    proctime2=$((utime+stime+cutime+cstime))
+    proc_perc_usg=$(((proctime2-proctime1)*100/(uptime2-uptime1)))
+}
+
+## cpu monitor $cpumon_pid $cpumon_span $cpumon_ival
+cpumon() {
+    export proc_usg
+    ## timespan
+    local span=${cpumon_span:-60}
+    ## interval
+    local ival=${cpumon_ival:-3}
+    [ "$ival" -gt "$span" ] && echo "span must be greater or equal the interval" && exit 1
+    local iter=$((span/ival))
+    local record=()
+    while true; do
+        # perc=$(top -n1 | grep php | grep -v grep | awk '{print gensub("%","","", $8)}')
+        proc_usg_u 0.1 ## sets proc_perc_usg
+        [ -z "$proc_perc_usg" ] && fleep $ival && continue
+        record+=($proc_perc_usg)
+        i=$((${#record[@]}-iter))
+        [ $i -lt 0 ] && i=0
+        record=(${record[@]:i})
+        sum=0
+        for p in ${record[@]}; do
+            sum=$((sum+p))
+        done
+        proc_usg=$((sum/${#record[@]}))
+        # span=$((ival*${#record[@]}))s
+        # echo "usage in $span is $proc_usg"
+        echo "$proc_usg"
+        fleep $ival
+    done
+}
+
+cpumon
