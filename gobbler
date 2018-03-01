@@ -14,10 +14,10 @@ b64d(){
 
 ## put a file into a var 1:1 naming
 fileToVar(){
-    $1=$(b64e <$1)
+    eval "$1=\"$(b64e <$1)\""
 }
 
 ## put a var into a file 1:1 naming
 varToFile(){
-    echo "$1" | b64d >"$1"
+    eval "echo \"\$$1\" | b64d >\"$1\""
 }
